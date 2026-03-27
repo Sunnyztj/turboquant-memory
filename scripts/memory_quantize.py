@@ -24,6 +24,98 @@ sys.path.insert(0, str(Path(__file__).parent))
 from turboquant import TurboQuantProd, pack_indices, unpack_indices
 
 
+def detect_vec0_tables(conn: sqlite3.Connection) -> dict:
+    """Auto-detect OpenClaw vec0 tables."""
+    # Look for tables using vec0 extension
+    cursor = conn.execute("""
+        SELECT name FROM sqlite_master 
+        WHERE type='table' AND sql LIKE '%USING vec0%'
+    """)
+    
+    vec0_tables = [row[0] for row in cursor.fetchall()]
+    
+    if not vec0_tables:
+        return None
+    
+    # Use first vec0 table found
+    table_name = vec0_tables[0]
+    
+    # Check if it has 'embedding' column and get dimension
+    cursor = conn.execute(f"PRAGMA table_info({table_name})")
+    cols = {row[1]: row[2] for row in cursor.fetchall()}
+    
+    if 'embedding' not in cols:
+        return None
+    
+    # Detect dimension from first row
+    cursor = conn.execute(f"SELECT embedding FROM {table_name} WHERE embedding IS NOT NULL LIMIT 1")
+    row = cursor.fetchone()
+    if row and row[0]:
+        vec = np.frombuffer(row[0], dtype=np.float32)
+        return {
+            "table": table_name,
+            "emb_col": "embedding", 
+            "id_col": "rowid",  # vec0 tables use rowid
+            "dim": len(vec),
+            "is_vec0": True
+        }
+    
+    return None
+
+
+class OpenClawVecReader:
+    """Efficient reader for OpenClaw vec0 embedding tables."""
+    
+    def __init__(self, conn: sqlite3.Connection, table_name: str, embedding_col: str = "embedding"):
+        self.conn = conn
+        self.table_name = table_name
+        self.embedding_col = embedding_col
+        
+        # Detect dimension
+        self.dim = self._detect_dimension()
+        if self.dim is None:
+            raise ValueError(f"Could not detect dimension from {table_name}.{embedding_col}")
+    
+    def _detect_dimension(self) -> int:
+        """Detect embedding dimension from first row."""
+        cursor = self.conn.execute(
+            f"SELECT {self.embedding_col} FROM {self.table_name} "
+            f"WHERE {self.embedding_col} IS NOT NULL LIMIT 1"
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            vec = np.frombuffer(row[0], dtype=np.float32)
+            return len(vec)
+        return None
+    
+    def read_batch(self, offset: int = 0, limit: int = 1000) -> List[Dict]:
+        """Read batch of embeddings with metadata."""
+        cursor = self.conn.execute(
+            f"SELECT rowid, {self.embedding_col} FROM {self.table_name} "
+            f"WHERE {self.embedding_col} IS NOT NULL "
+            f"LIMIT {limit} OFFSET {offset}"
+        )
+        
+        batch = []
+        for row in cursor:
+            vec = np.frombuffer(row[1], dtype=np.float32)
+            if len(vec) == self.dim:
+                batch.append({
+                    "id": str(row[0]),
+                    "embedding": vec
+                })
+        
+        return batch
+    
+    def count_embeddings(self) -> int:
+        """Count total embeddings."""
+        cursor = self.conn.execute(
+            f"SELECT COUNT(*) FROM {self.table_name} "
+            f"WHERE {self.embedding_col} IS NOT NULL"
+        )
+        return cursor.fetchone()[0]
+
+
 def detect_embedding_schema(conn: sqlite3.Connection) -> dict:
     """Auto-detect embedding column and dimension from a SQLite database."""
     # Common table/column patterns for memory systems
@@ -88,77 +180,134 @@ def load_embeddings(conn: sqlite3.Connection, schema: dict) -> list:
 
 
 def create_quantized_table(conn: sqlite3.Connection):
-    """Create table for quantized embeddings."""
+    """Create table for quantized embeddings with fp16 scales."""
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS quantized_embeddings (
             memory_id TEXT PRIMARY KEY,
             norm REAL NOT NULL,
+            scale REAL NOT NULL,
             mse_indices BLOB NOT NULL,
             qjl_signs BLOB NOT NULL,
             residual_norm REAL NOT NULL,
             bits INTEGER NOT NULL,
             dim INTEGER NOT NULL,
             seed_rot INTEGER NOT NULL DEFAULT 42,
-            seed_qjl INTEGER NOT NULL DEFAULT 137
+            seed_qjl INTEGER NOT NULL DEFAULT 137,
+            sketch_dim INTEGER NOT NULL DEFAULT 256
         );
         CREATE INDEX IF NOT EXISTS idx_qe_memory_id ON quantized_embeddings(memory_id);
     """)
 
 
-def migrate(db_path: str, bits: int = 4, seed_rot: int = 42, seed_qjl: int = 137):
+def migrate(db_path: str, bits: int = 4, seed_rot: int = 42, seed_qjl: int = 137, sketch_dim: int = 256):
     """Quantize all embeddings and store in quantized_embeddings table."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     
-    schema = detect_embedding_schema(conn)
+    # Try vec0 tables first, then fallback to generic detection
+    schema = detect_vec0_tables(conn)
+    if not schema:
+        schema = detect_embedding_schema(conn)
+    
     if not schema:
         print("❌ Could not detect embedding schema in database")
         conn.close()
         return False
     
     print(f"📋 Detected: table={schema['table']}, dim={schema['dim']}")
+    if schema.get('is_vec0'):
+        print("📋 Using vec0 table format")
     
-    data = load_embeddings(conn, schema)
-    print(f"📦 Loaded {len(data)} embeddings")
-    
-    if not data:
-        conn.close()
-        return False
-    
-    # Initialize quantizer
-    dim = schema['dim']
-    quantizer = TurboQuantProd(dim=dim, bits=bits, seed_rot=seed_rot, seed_qjl=seed_qjl)
-    mse_bits = bits - 1  # TurboQuantProd uses (bits-1) for MSE + 1 for QJL
-    
-    # Create table
-    create_quantized_table(conn)
-    
-    # Quantize and store
-    t0 = time.time()
-    count = 0
-    for item in data:
-        qdata = quantizer.quantize(item['embedding'])
-        packed_mse = pack_indices(qdata['mse_indices'], mse_bits)
-        packed_qjl = pack_indices(qdata['qjl_signs'], 1)
+    # Use batch processing for large datasets
+    if schema.get('is_vec0'):
+        reader = OpenClawVecReader(conn, schema['table'], schema['emb_col'])
+        total_count = reader.count_embeddings()
+        print(f"📦 Total embeddings: {total_count}")
         
-        conn.execute(
-            "INSERT OR REPLACE INTO quantized_embeddings "
-            "(memory_id, norm, mse_indices, qjl_signs, residual_norm, bits, dim, seed_rot, seed_qjl) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (item['id'], qdata['norm'], packed_mse, packed_qjl,
-             qdata['residual_norm'], bits, dim, seed_rot, seed_qjl)
-        )
-        count += 1
-        if count % 100 == 0:
-            print(f"  Quantized {count}/{len(data)}...")
+        # Initialize quantizer
+        quantizer = TurboQuantProd(dim=reader.dim, bits=bits, seed_rot=seed_rot, seed_qjl=seed_qjl, sketch_dim=sketch_dim)
+        
+        # Create table
+        create_quantized_table(conn)
+        
+        # Process in batches
+        batch_size = 1000
+        mse_bits = bits - 1
+        t0 = time.time()
+        total_processed = 0
+        
+        for offset in range(0, total_count, batch_size):
+            batch = reader.read_batch(offset, batch_size)
+            if not batch:
+                break
+            
+            for item in batch:
+                qdata = quantizer.quantize(item['embedding'])
+                packed_mse = pack_indices(qdata['mse_indices'], mse_bits)
+                packed_qjl = pack_indices(qdata['qjl_signs'], 1)
+                
+                conn.execute(
+                    "INSERT OR REPLACE INTO quantized_embeddings "
+                    "(memory_id, norm, scale, mse_indices, qjl_signs, residual_norm, bits, dim, seed_rot, seed_qjl, sketch_dim) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (item['id'], qdata['norm'], qdata['scale'], packed_mse, packed_qjl,
+                     qdata['residual_norm'], bits, reader.dim, seed_rot, seed_qjl, sketch_dim)
+                )
+                total_processed += 1
+            
+            if total_processed % 1000 == 0:
+                print(f"  Quantized {total_processed}/{total_count}...")
+                conn.commit()  # Commit periodically
+        
+        conn.commit()
+        count = total_processed
+        
+        # Size comparison  
+        original_size = total_count * reader.dim * 4  # float32
     
-    conn.commit()
+    else:
+        # Legacy processing for non-vec0 tables
+        data = load_embeddings(conn, schema)
+        print(f"📦 Loaded {len(data)} embeddings")
+        
+        if not data:
+            conn.close()
+            return False
+        
+        # Initialize quantizer
+        dim = schema['dim']
+        quantizer = TurboQuantProd(dim=dim, bits=bits, seed_rot=seed_rot, seed_qjl=seed_qjl, sketch_dim=sketch_dim)
+        mse_bits = bits - 1
+        
+        # Create table
+        create_quantized_table(conn)
+        
+        # Quantize and store
+        t0 = time.time()
+        count = 0
+        for item in data:
+            qdata = quantizer.quantize(item['embedding'])
+            packed_mse = pack_indices(qdata['mse_indices'], mse_bits)
+            packed_qjl = pack_indices(qdata['qjl_signs'], 1)
+            
+            conn.execute(
+                "INSERT OR REPLACE INTO quantized_embeddings "
+                "(memory_id, norm, scale, mse_indices, qjl_signs, residual_norm, bits, dim, seed_rot, seed_qjl, sketch_dim) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (item['id'], qdata['norm'], qdata['scale'], packed_mse, packed_qjl,
+                 qdata['residual_norm'], bits, dim, seed_rot, seed_qjl, sketch_dim)
+            )
+            count += 1
+            if count % 100 == 0:
+                print(f"  Quantized {count}/{len(data)}...")
+        
+        conn.commit()
+        original_size = sum(len(item['embedding']) * 4 for item in data)
+    
     elapsed = time.time() - t0
     
-    # Size comparison
-    original_size = sum(len(item['embedding']) * 4 for item in data)
     compressed_size = conn.execute(
-        "SELECT SUM(LENGTH(mse_indices) + LENGTH(qjl_signs) + 16) FROM quantized_embeddings"
+        "SELECT SUM(LENGTH(mse_indices) + LENGTH(qjl_signs) + 20) FROM quantized_embeddings"
     ).fetchone()[0]
     
     conn.close()
@@ -173,28 +322,54 @@ def migrate(db_path: str, bits: int = 4, seed_rot: int = 42, seed_qjl: int = 137
     return True
 
 
-def benchmark(db_path: str, bits: int = 4, n_queries: int = 30):
+def benchmark(db_path: str, bits: int = 4, n_queries: int = 30, sketch_dim: int = 256):
     """Benchmark quantized search accuracy against brute-force."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     
-    schema = detect_embedding_schema(conn)
+    # Try vec0 tables first
+    schema = detect_vec0_tables(conn)
+    if not schema:
+        schema = detect_embedding_schema(conn)
+    
     if not schema:
         print("❌ Could not detect embedding schema")
         conn.close()
         return
     
-    data = load_embeddings(conn, schema)
+    # Load embeddings with size limit for benchmarking
+    max_vectors = 5000  # Limit for performance
+    
+    if schema.get('is_vec0'):
+        reader = OpenClawVecReader(conn, schema['table'], schema['emb_col'])
+        total_count = reader.count_embeddings()
+        limit = min(max_vectors, total_count)
+        
+        embeddings = []
+        data = []
+        for offset in range(0, limit, 1000):
+            batch = reader.read_batch(offset, min(1000, limit - offset))
+            for item in batch:
+                embeddings.append(item['embedding'])
+                data.append(item)
+            if len(embeddings) >= limit:
+                break
+        
+        dim = reader.dim
+    else:
+        data = load_embeddings(conn, schema)
+        data = data[:max_vectors]  # Limit size
+        embeddings = [d['embedding'] for d in data]
+        dim = schema['dim']
+    
     conn.close()
     
-    print(f"📋 {len(data)} vectors, dim={schema['dim']}, bits={bits}")
+    print(f"📋 {len(data)} vectors, dim={dim}, bits={bits}")
     
-    dim = schema['dim']
-    quantizer = TurboQuantProd(dim=dim, bits=bits)
+    quantizer = TurboQuantProd(dim=dim, bits=bits, sketch_dim=sketch_dim)
     
     # Quantize all
     t0 = time.time()
-    embeddings = [d['embedding'] for d in data]
     quantized_db = [quantizer.quantize(e) for e in embeddings]
     qt = time.time() - t0
     print(f"⏱️  Quantized in {qt:.1f}s")
@@ -203,8 +378,8 @@ def benchmark(db_path: str, bits: int = 4, n_queries: int = 30):
     original_bytes = sum(len(e) * 4 for e in embeddings)
     compressed_bytes = 0
     for q in quantized_db:
-        compressed_bytes += 8 + len(pack_indices(q['mse_indices'], bits-1)) + \
-                           len(pack_indices(q['qjl_signs'], 1)) + 8
+        compressed_bytes += 12 + len(pack_indices(q['mse_indices'], bits-1)) + \
+                           len(pack_indices(q['qjl_signs'], 1)) + 8  # norm + scale + residual_norm
     print(f"📦 Compression: {original_bytes/1024:.0f} KB → {compressed_bytes/1024:.0f} KB ({original_bytes/compressed_bytes:.1f}x)")
     
     # Search benchmark
