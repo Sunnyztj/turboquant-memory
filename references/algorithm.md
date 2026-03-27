@@ -2,62 +2,72 @@
 
 ## Overview
 
-TurboQuant (ICLR 2026, Google Research) is a near-optimal vector quantization algorithm that compresses high-dimensional vectors to 2-4 bits per coordinate with provably minimal distortion. It is **data-oblivious** (no training/calibration needed) and works **online** (each vector quantized independently).
+TurboQuant (ICLR 2026, Google Research) is a near-optimal vector quantization algorithm that compresses high-dimensional vectors to 3-8 bits per coordinate with provably minimal distortion. It is **data-oblivious** (no training/calibration needed) and works **online** (each vector quantized independently).
 
 Paper: [arXiv:2504.19874](https://arxiv.org/abs/2504.19874)
 
 ## How It Works
 
-**Random Rotation → Predictable Distribution → Optimal Scalar Quantization**
+**Blockwise Hadamard Rotation → Predictable Distribution → Optimal Scalar Quantization**
 
-1. Multiply input vector by a fixed random orthogonal matrix Π (from QR decomposition of random Gaussian). This makes every coordinate follow the same Beta distribution ≈ N(0, 1/d), regardless of the original vector.
+1. **Blockwise rotation**: Split the vector into power-of-2 blocks (e.g., 3072 = 3 × 1024). Per block, multiply by random ±1 signs, then apply the Fast Walsh-Hadamard Transform. This is fully invertible and makes coordinates approximately independent with a known distribution ≈ N(0, 1/d).
 
-2. Since coordinates are now ~independent with a known distribution, apply a precomputed Lloyd-Max optimal scalar quantizer to each coordinate independently. This is provably the best b-bit scalar quantizer for that distribution.
+2. **Lloyd-Max quantization**: Since coordinates now follow a predictable distribution, apply a precomputed optimal scalar quantizer to each coordinate independently. Codebooks are precomputed for standard normal and hardcoded for 4-8 bit widths.
 
-3. For unbiased inner product estimation (needed for search), add a 1-bit QJL (Quantized Johnson-Lindenstrauss) correction on the residual. This eliminates the bias that MSE-optimal quantizers introduce in dot products.
+3. **Per-vector scale**: Store a single scale factor (the std of rotated coordinates) to adapt the global codebook to each vector's dynamic range.
+
+### Why Blockwise Hadamard?
+
+The original TurboQuant paper uses a full random orthogonal matrix (QR decomposition). We use blockwise Hadamard instead because:
+
+- **O(d log d)** computation vs O(d³) for QR
+- **O(d)** memory (just sign vectors) vs O(d²) for full matrix
+- **Fully invertible** — no information loss
+- **Identical quality** on real embeddings (verified via ablation)
+
+Important: Subsampled Randomized Hadamard Transform (SRHT) — where you pad to a larger power of 2 then subsample back — introduces **irreversible information loss** and should NOT be used. Our ablation showed it creates a hard MSE floor that makes bit-width increases ineffective.
 
 ## Two Modes
 
-### TurboQuant_mse (Algorithm 1)
+### TurboQuantMSE (Recommended)
 - Uses all b bits for MSE-optimal quantization
-- Best for: storage compression, nearest-neighbor by L2 distance
-- MSE distortion: ≈ 0.36 (b=1), 0.117 (b=2), 0.03 (b=3), 0.009 (b=4)
+- Best for: cosine similarity search, retrieval, RAG, memory search
+- **Recommended as default** for most use cases
 
-### TurboQuant_prod (Algorithm 2) — Recommended for search
+### TurboQuantProd
 - Uses (b-1) bits for MSE + 1 bit for QJL residual correction
-- Guarantees **unbiased** inner product estimation
-- Best for: cosine similarity search, retrieval, RAG
-- IP distortion: ≈ 0.047/d at b=4 (for d=768: correlation > 0.98)
+- Theoretically provides unbiased inner product estimation
+- In practice: only beneficial for very large databases (10k+) or ultra-low bit (2-3 bit)
+- Not recommended as default for small/medium collections
 
 ## Choosing Bit-Width
 
-| Bits | Compression | MSE | IP Correlation (d=768) | Recommended For |
-|------|-------------|-----|----------------------|-----------------|
-| 2 | ~16x | 0.117 | ~0.80 | Maximum compression, approximate search |
-| 3 | ~8x | 0.03 | ~0.93 | Good balance for large datasets |
-| 4 | ~8x | 0.009 | ~0.86 | Maximum compression, some recall loss |
-| 5 | ~6x | 0.003 | ~0.92 | Good balance for large datasets |
-| **6** | **~5x** | **0.001** | **~0.98** | **Default — best quality/compression tradeoff** |
+| Bits | Compression | Cosine Similarity | Recall@1 | Recommended For |
+|------|-------------|-------------------|----------|-----------------|
+| 3 | ~10.6x | 0.982 | ~88% | Maximum compression, approximate search |
+| 4 | ~8.0x | 0.995 | ~92% | Large-scale, storage-constrained |
+| **5** | **~6.4x** | **0.999** | **~98%** | **Default — best quality/compression tradeoff** |
+| 6 | ~5.3x | 1.000 | ~98% | Conservative, high-fidelity |
+| 7 | ~4.6x | 1.000 | ~100% | Near-lossless |
+| 8 | ~4.0x | 1.000 | ~100% | Maximum quality |
 
 ## Dimension Considerations
 
-- **d ≥ 128**: Algorithm works well, Gaussian approximation is accurate
-- **d = 768** (Gemini, many sentence transformers): Sweet spot
-- **d = 1536** (OpenAI text-embedding-3-large): Excellent, even higher correlation
-- **d = 3072** (some code embeddings): Near-perfect at b=4
+- **d ≥ 128**: Algorithm works well
+- **d = 768** (many sentence transformers): Good
+- **d = 1536** (OpenAI text-embedding-3-large): Very good
+- **d = 3072** (Gemini embedding-001): Excellent — higher dimensions improve quantization quality
 
 Higher dimensions → better quantization quality (concentration of measure).
 
-## Asymmetric Search
-
-The key performance trick: keep queries in full float32, only quantize the database.
-- Query rotation: q_rot = Π · q (one matrix multiply per query)
-- Score computation: dot product with codebook centroids + QJL correction
-- No need to dequantize stored vectors → saves memory and computation
+The blockwise decomposition automatically handles any dimension by splitting into the largest possible power-of-2 blocks. For example:
+- 3072 = 3 × 1024
+- 1536 = 1024 + 512
+- 768 = 512 + 256
 
 ## Theoretical Guarantees
 
 - MSE within **2.7x** of information-theoretic lower bound (Shannon)
-- Inner product estimator is **mathematically unbiased** (Theorem 2)
-- **Zero indexing time** — no offline training, no codebook learning from data
-- Provably near-optimal across ALL bit-widths and dimensions
+- **Zero indexing time** — no offline training, no codebook learning
+- **Deterministic** — same seed produces identical quantization
+- Provably near-optimal across all bit-widths and dimensions
