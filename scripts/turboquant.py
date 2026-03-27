@@ -150,42 +150,78 @@ LLOYD_MAX_CODEBOOKS: Dict[int, np.ndarray] = {
 # fmt: on
 
 
-class SRHTRotate:
+class BlockwiseHadamardRotate:
     """
-    Subsampled Randomized Hadamard Transform for near-isometry rotation.
-    Replaces dense QR decomposition with pad → sign-flip → FWHT → subsample.
+    Blockwise Hadamard rotation: split dim into blocks of power-of-2,
+    apply independent sign-flip + FWHT per block. Fully invertible, zero
+    information loss. Replaces SRHT subsample which had lossy truncation.
+
+    For dim=3072: 3 blocks of 1024 (each is 2^10).
+    For arbitrary dim: greedily decompose into largest power-of-2 blocks.
     """
 
-    def __init__(self, input_dim: int, output_dim: int, seed: int = 42):
-        self.input_dim = input_dim
-        self.output_dim = output_dim
+    def __init__(self, dim: int, seed: int = 42):
+        self.dim = dim
         self.seed = seed
 
-        self.padded_dim = 1
-        while self.padded_dim < input_dim:
-            self.padded_dim *= 2
+        # Decompose dim into power-of-2 blocks
+        self.blocks: list = []  # list of (start, size)
+        remaining = dim
+        offset = 0
+        while remaining > 0:
+            # Largest power of 2 <= remaining
+            block_size = 1
+            while block_size * 2 <= remaining:
+                block_size *= 2
+            self.blocks.append((offset, block_size))
+            offset += block_size
+            remaining -= block_size
 
+        # Generate per-block random signs
         rng = np.random.RandomState(seed)
-        self.signs = rng.choice([-1.0, 1.0], size=self.padded_dim).astype(np.float64)
-        self.subsample_indices = np.sort(
-            rng.choice(self.padded_dim, size=output_dim, replace=False)
-        )
-        self.scale = np.sqrt(self.padded_dim / output_dim)
+        self.block_signs: list = []
+        for _, bsize in self.blocks:
+            self.block_signs.append(
+                rng.choice([-1.0, 1.0], size=bsize).astype(np.float64)
+            )
 
     def apply(self, x: np.ndarray) -> np.ndarray:
-        x_padded = np.zeros(self.padded_dim)
-        x_padded[: self.input_dim] = x
-        x_padded *= self.signs
-        x_fwht = fwht(x_padded)
-        return x_fwht[self.subsample_indices] * self.scale
+        """Forward rotation (sign-flip + FWHT per block)."""
+        out = np.empty(self.dim, dtype=np.float64)
+        for (start, bsize), signs in zip(self.blocks, self.block_signs):
+            block = x[start : start + bsize].astype(np.float64) * signs
+            out[start : start + bsize] = fwht(block)
+        return out
+
+    def apply_inverse(self, y: np.ndarray) -> np.ndarray:
+        """Inverse rotation (FWHT is self-inverse up to normalization, then undo signs)."""
+        out = np.empty(self.dim, dtype=np.float64)
+        for (start, bsize), signs in zip(self.blocks, self.block_signs):
+            block = fwht(y[start : start + bsize].astype(np.float64))
+            out[start : start + bsize] = block * signs
+        return out
 
     def apply_batch(self, X: np.ndarray) -> np.ndarray:
-        batch = X.shape[0]
-        X_padded = np.zeros((batch, self.padded_dim))
-        X_padded[:, : self.input_dim] = X
-        X_padded *= self.signs[np.newaxis, :]
-        X_fwht = fwht(X_padded)
-        return X_fwht[:, self.subsample_indices] * self.scale
+        """Forward rotation on batch (N, dim)."""
+        out = np.empty_like(X, dtype=np.float64)
+        for (start, bsize), signs in zip(self.blocks, self.block_signs):
+            block = X[:, start : start + bsize].astype(np.float64) * signs[np.newaxis, :]
+            out[:, start : start + bsize] = fwht(block)
+        return out
+
+    def apply_inverse_batch(self, Y: np.ndarray) -> np.ndarray:
+        """Inverse rotation on batch (N, dim)."""
+        out = np.empty_like(Y, dtype=np.float64)
+        for (start, bsize), signs in zip(self.blocks, self.block_signs):
+            block = fwht(Y[:, start : start + bsize].astype(np.float64))
+            out[:, start : start + bsize] = block * signs[np.newaxis, :]
+        return out
+
+
+class SRHTRotate(BlockwiseHadamardRotate):
+    """Backward-compatible alias. Ignores output_dim (always == input_dim now)."""
+    def __init__(self, input_dim: int, output_dim: int = None, seed: int = 42):
+        super().__init__(dim=input_dim, seed=seed)
 
 
 def compute_lloyd_max_codebook(bits: int) -> np.ndarray:
@@ -335,7 +371,8 @@ class TurboQuantMSE:
         indices = data["indices"]
         if norm < 1e-12:
             return np.zeros(self.dim)
-        return self.codebook[indices] * scale * norm
+        x_rotated = self.codebook[indices] * scale
+        return self.rotation.apply_inverse(x_rotated) * norm
 
     def quantize_batch(self, X: np.ndarray) -> List[Dict]:
         return [self.quantize(x) for x in X]
@@ -344,20 +381,28 @@ class TurboQuantMSE:
 class SRHTSketch:
     """
     SRHT sketch for QJL residual encoding.
-    Projects to m << d dimensions, stores sign bits only (m/8 bytes).
+    Projects to m << d dimensions using blockwise Hadamard + fixed subsampling,
+    then stores sign bits only (m/8 bytes).
     """
 
     def __init__(self, input_dim: int, sketch_dim: int = 256, seed: int = 137):
         self.input_dim = input_dim
         self.sketch_dim = sketch_dim
         self.seed = seed
-        self.srht = SRHTRotate(input_dim, sketch_dim, seed)
+        # Use a separate blockwise rotation for the sketch
+        self.rotation = BlockwiseHadamardRotate(input_dim, seed=seed)
+        # Fixed random indices to subsample from rotated output
+        rng = np.random.RandomState(seed + 1000)
+        self.indices = np.sort(rng.choice(input_dim, size=sketch_dim, replace=False))
+        self.scale = np.sqrt(input_dim / sketch_dim)
 
     def sketch(self, x: np.ndarray) -> np.ndarray:
-        return self.srht.apply(x)
+        rotated = self.rotation.apply(x)
+        return rotated[self.indices] * self.scale
 
     def sketch_batch(self, X: np.ndarray) -> np.ndarray:
-        return self.srht.apply_batch(X)
+        rotated = self.rotation.apply_batch(X)
+        return rotated[:, self.indices] * self.scale
 
 
 class TurboQuantProd:
